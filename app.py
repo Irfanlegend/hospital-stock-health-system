@@ -200,7 +200,7 @@ st.subheader("🔎 Filter Data")
 
 c1, c2, c3 = st.columns(3)
 
-medicine_filter = c1.selectbox("Select Medicine", ["All"] + sorted(stock_df["medicine_name"].unique()))
+medicine_filter = c1.selectbox("Select Medicine", ["All"] + sorted(stock_df["MEDICINE_NAME"].unique()))
 hospital_filter = c2.selectbox("Select Hospital", ["All"] + sorted(stock_df["hospital_name"].unique()))
 reset_btn = c3.button("Reset Filters")
 
