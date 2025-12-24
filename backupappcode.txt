@@ -1,0 +1,862 @@
+import streamlit as st
+import pandas as pd
+import plotly.express as px
+import plotly.graph_objects as go
+from datetime import datetime
+import snowflake.connector
+from snowflake.connector.pandas_tools import write_pandas
+
+# Page configuration
+st.set_page_config(
+    page_title="Hospital Stock Management System",
+    page_icon="🏥",
+    layout="wide"
+)
+
+# Snowflake connection function (NO CACHE - always fresh connection)
+def get_snowflake_connection():
+    """
+    Connect to Snowflake using credentials from sidebar
+    """
+    try:
+        # First connect without warehouse/database
+        conn = snowflake.connector.connect(
+            user=st.session_state.get('sf_user', ''),
+            password=st.session_state.get('sf_password', ''),
+            account=st.session_state.get('sf_account', '')
+        )
+        
+        cursor = conn.cursor()
+        
+        # Create warehouse if it doesn't exist
+        cursor.execute("CREATE WAREHOUSE IF NOT EXISTS COMPUTE_WH WITH WAREHOUSE_SIZE='X-SMALL' AUTO_SUSPEND=60 AUTO_RESUME=TRUE")
+        cursor.execute("USE WAREHOUSE COMPUTE_WH")
+        
+        # Create database and schema if they don't exist
+        cursor.execute("CREATE DATABASE IF NOT EXISTS HOSPITAL_STOCK_DB")
+        cursor.execute("USE DATABASE HOSPITAL_STOCK_DB")
+        cursor.execute("CREATE SCHEMA IF NOT EXISTS INVENTORY")
+        cursor.execute("USE SCHEMA INVENTORY")
+        
+        cursor.close()
+        return conn
+    except Exception as e:
+        st.error(f"Connection failed: {str(e)}")
+        return None
+
+# Test connection function
+def test_connection(user, password, account):
+    """
+    Test if Snowflake credentials are valid
+    """
+    try:
+        # First, connect without specifying warehouse/database
+        conn = snowflake.connector.connect(
+            user=user,
+            password=password,
+            account=account
+        )
+        cursor = conn.cursor()
+        
+        # Get account info
+        cursor.execute("SELECT CURRENT_ACCOUNT(), CURRENT_REGION()")
+        result = cursor.fetchone()
+        
+        # Check if warehouse exists, if not create it
+        cursor.execute("SHOW WAREHOUSES LIKE 'COMPUTE_WH'")
+        warehouses = cursor.fetchall()
+        if len(warehouses) == 0:
+            cursor.execute("CREATE WAREHOUSE IF NOT EXISTS COMPUTE_WH WITH WAREHOUSE_SIZE='X-SMALL' AUTO_SUSPEND=60 AUTO_RESUME=TRUE")
+        
+        cursor.close()
+        conn.close()
+        return True, f"Account: {result[0]}, Region: {result[1]}"
+    except Exception as e:
+        return False, str(e)
+
+# Function to load data from CSV to Snowflake
+def load_sample_data_to_snowflake(conn):
+    """
+    Load the sample CSV data into Snowflake
+    """
+    try:
+        cursor = conn.cursor()
+        
+        # Step 1: Create the main stock table
+        st.info("Checking tables...")
+        cursor.execute("""
+            CREATE TABLE IF NOT EXISTS STOCK_RECORDS (
+                date DATE,
+                hospital_id VARCHAR(10),
+                hospital_name VARCHAR(100),
+                medicine_name VARCHAR(100),
+                opening_stock NUMBER,
+                received NUMBER,
+                issued NUMBER,
+                closing_stock NUMBER,
+                lead_time_days NUMBER,
+                min_stock_level NUMBER
+            )
+        """)
+        
+        # Step 2: Drop existing objects (dynamic tables depend on each other)
+        st.info("Setting up Dynamic Tables...")
+        try:
+            cursor.execute("DROP DYNAMIC TABLE IF EXISTS REORDER_RECOMMENDATIONS")
+        except:
+            pass
+        try:
+            cursor.execute("DROP DYNAMIC TABLE IF EXISTS CURRENT_STOCK_STATUS")
+        except:
+            pass
+        try:
+            cursor.execute("DROP VIEW IF EXISTS REORDER_RECOMMENDATIONS")
+        except:
+            pass
+        try:
+            cursor.execute("DROP VIEW IF EXISTS CURRENT_STOCK_STATUS")
+        except:
+            pass
+        
+        # Step 3: Create Dynamic Tables (auto-refresh)
+        cursor.execute("""
+            CREATE OR REPLACE DYNAMIC TABLE CURRENT_STOCK_STATUS
+            TARGET_LAG = '1 minute'
+            WAREHOUSE = COMPUTE_WH
+            AS
+            SELECT 
+                hospital_id,
+                hospital_name,
+                medicine_name,
+                closing_stock as current_stock,
+                min_stock_level,
+                lead_time_days,
+                AVG(issued) OVER (
+                    PARTITION BY hospital_id, medicine_name 
+                    ORDER BY date 
+                    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+                ) as avg_daily_usage,
+                CASE 
+                    WHEN closing_stock <= min_stock_level THEN 'CRITICAL'
+                    WHEN closing_stock / NULLIF(AVG(issued) OVER (
+                        PARTITION BY hospital_id, medicine_name 
+                        ORDER BY date 
+                        ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+                    ), 0) <= lead_time_days THEN 'WARNING'
+                    ELSE 'HEALTHY'
+                END as stock_status,
+                ROUND(closing_stock / NULLIF(AVG(issued) OVER (
+                    PARTITION BY hospital_id, medicine_name 
+                    ORDER BY date 
+                    ROWS BETWEEN 6 PRECEDING AND CURRENT ROW
+                ), 0), 1) as days_until_stockout,
+                date
+            FROM STOCK_RECORDS
+            QUALIFY ROW_NUMBER() OVER (PARTITION BY hospital_id, medicine_name ORDER BY date DESC) = 1
+        """)
+        
+        cursor.execute("""
+            CREATE OR REPLACE DYNAMIC TABLE REORDER_RECOMMENDATIONS
+            TARGET_LAG = '1 minute'
+            WAREHOUSE = COMPUTE_WH
+            AS
+            SELECT 
+                hospital_id,
+                hospital_name,
+                medicine_name,
+                current_stock,
+                avg_daily_usage,
+                lead_time_days,
+                stock_status,
+                days_until_stockout,
+                CASE 
+                    WHEN stock_status = 'CRITICAL' THEN 
+                        GREATEST(ROUND((avg_daily_usage * (lead_time_days + 30)) - current_stock), 0)
+                    WHEN stock_status = 'WARNING' THEN 
+                        GREATEST(ROUND((avg_daily_usage * (lead_time_days + 15)) - current_stock), 0)
+                    ELSE 0
+                END as recommended_order_quantity,
+                CASE 
+                    WHEN stock_status = 'CRITICAL' THEN 1
+                    WHEN stock_status = 'WARNING' THEN 2
+                    ELSE 3
+                END as priority
+            FROM CURRENT_STOCK_STATUS
+            ORDER BY priority, hospital_id, medicine_name
+        """)
+        
+        st.success("✅ Dynamic Tables created! (Auto-refresh every 1 minute)")
+        
+        st.info("Tables created! Loading data...")
+        
+        # Step 3: Read CSV file
+        df = pd.read_csv('sample_data.csv')
+        
+        # Rename columns to uppercase to match Snowflake table
+        df.columns = df.columns.str.upper()
+        
+        # Convert date column to proper string format for Snowflake
+        df['DATE'] = pd.to_datetime(df['DATE']).dt.strftime('%Y-%m-%d')
+        
+        # Step 4: Write to Snowflake
+        success, nchunks, nrows, _ = write_pandas(
+            conn=conn,
+            df=df,
+            table_name='STOCK_RECORDS',
+            database='HOSPITAL_STOCK_DB',
+            schema='INVENTORY',
+            auto_create_table=False
+        )
+        
+        cursor.close()
+        
+        if success:
+            st.success(f"✅ Successfully loaded {nrows} records into Snowflake!")
+            return True
+        return False
+    except Exception as e:
+        st.error(f"Error loading data: {str(e)}")
+        return False
+
+# Function to get current stock data
+def get_current_stock_data(conn):
+    """
+    Fetch current stock status from Snowflake
+    """
+    query = """
+    SELECT 
+        HOSPITAL_ID,
+        HOSPITAL_NAME,
+        MEDICINE_NAME,
+        CURRENT_STOCK,
+        MIN_STOCK_LEVEL,
+        LEAD_TIME_DAYS,
+        AVG_DAILY_USAGE,
+        STOCK_STATUS,
+        DAYS_UNTIL_STOCKOUT,
+        DATE
+    FROM CURRENT_STOCK_STATUS 
+    ORDER BY HOSPITAL_ID, MEDICINE_NAME
+    """
+    df = pd.read_sql(query, conn)
+    # Convert column names to lowercase for easier handling
+    df.columns = df.columns.str.lower()
+    return df
+
+# Function to get reorder recommendations
+def get_reorder_recommendations(conn):
+    """
+    Fetch reorder recommendations from Snowflake
+    """
+    query = """
+    SELECT 
+        HOSPITAL_ID,
+        HOSPITAL_NAME,
+        MEDICINE_NAME,
+        CURRENT_STOCK,
+        AVG_DAILY_USAGE,
+        LEAD_TIME_DAYS,
+        STOCK_STATUS,
+        DAYS_UNTIL_STOCKOUT,
+        RECOMMENDED_ORDER_QUANTITY,
+        PRIORITY
+    FROM REORDER_RECOMMENDATIONS 
+    WHERE STOCK_STATUS IN ('CRITICAL', 'WARNING')
+    ORDER BY PRIORITY, DAYS_UNTIL_STOCKOUT
+    """
+    df = pd.read_sql(query, conn)
+    # Convert column names to lowercase for easier handling
+    df.columns = df.columns.str.lower()
+    return df
+
+# Function to create heatmap
+def create_stock_heatmap(df):
+    """
+    Create an interactive heatmap showing stock status across hospitals and medicines
+    """
+    # Pivot data for heatmap
+    pivot_df = df.pivot_table(
+        values='current_stock',
+        index='medicine_name',
+        columns='hospital_name',
+        aggfunc='sum'
+    )
+    
+    # Simple color scale - no gradients, pure colors
+    fig = go.Figure(data=go.Heatmap(
+        z=pivot_df.values,
+        x=pivot_df.columns,
+        y=pivot_df.index,
+        colorscale=[
+            [0, '#dc3545'],      # Red for critical
+            [0.33, '#ffc107'],   # Yellow for warning
+            [0.66, '#17a2b8'],   # Cyan for moderate
+            [1, '#28a745']       # Green for healthy
+        ],
+        text=pivot_df.values,
+        texttemplate='<b>%{text}</b>',
+        textfont={"size": 13, "color": "white"},
+        colorbar=dict(
+            title=dict(text="Stock Level", font=dict(size=13)),
+            tickfont=dict(size=11)
+        ),
+        hovertemplate='<b>%{y}</b><br>%{x}<br>Stock: %{z}<extra></extra>'
+    ))
+    
+    fig.update_layout(
+        title="🔥 Stock Levels Heatmap",
+        xaxis_title="Hospital",
+        yaxis_title="Medicine",
+        height=500
+    )
+    
+    return fig
+
+# Function to create status distribution chart
+def create_status_chart(df):
+    """
+    Create a pie chart showing distribution of stock statuses
+    """
+    status_counts = df['stock_status'].value_counts()
+    
+    # Simple solid colors - no gradients
+    colors = {
+        'CRITICAL': '#dc3545',  # Red
+        'WARNING': '#ffc107',   # Yellow
+        'HEALTHY': '#28a745'    # Green
+    }
+    
+    fig = go.Figure(data=[go.Pie(
+        labels=status_counts.index,
+        values=status_counts.values,
+        hole=0.4,
+        marker=dict(
+            colors=[colors.get(status, '#6c757d') for status in status_counts.index],
+            line=dict(color='white', width=2)
+        ),
+        textfont=dict(size=14, color='white'),
+        hovertemplate='<b>%{label}</b><br>Count: %{value}<extra></extra>'
+    )])
+    
+    fig.update_layout(
+        title="📊 Status Distribution",
+        annotations=[dict(
+            text=f'<b>{status_counts.sum()}</b><br>Total',
+            x=0.5, y=0.5,
+            font_size=15,
+            showarrow=False
+        )],
+        height=450,
+        showlegend=True
+    )
+    
+    return fig
+
+# Function to generate AI-like alert summary
+def generate_alert_summary(reorder_df):
+    """
+    Generate plain-language summary of critical alerts
+    """
+    if len(reorder_df) == 0:
+        return "✅ All stock levels are healthy. No immediate action required."
+    
+    critical_count = len(reorder_df[reorder_df['stock_status'] == 'CRITICAL'])
+    warning_count = len(reorder_df[reorder_df['stock_status'] == 'WARNING'])
+    
+    summary = f"⚠️ **STOCK ALERT SUMMARY**\n\n"
+    summary += f"- **{critical_count}** medicines at CRITICAL levels (immediate action required)\n"
+    summary += f"- **{warning_count}** medicines at WARNING levels (reorder soon)\n\n"
+    
+    if critical_count > 0:
+        summary += "**Most Urgent Items:**\n"
+        top_critical = reorder_df[reorder_df['stock_status'] == 'CRITICAL'].head(3)
+        for idx, row in top_critical.iterrows():
+            summary += f"- {row['hospital_name']}: **{row['medicine_name']}** "
+            summary += f"(Only {int(row['current_stock'])} units left, "
+            summary += f"avg daily use: {int(row['avg_daily_usage'])} units)\n"
+    
+    return summary
+
+# ============ MAIN APP ============
+
+# Custom CSS for better boxes
+st.markdown("""
+    <style>
+    .main-box {
+        background-color: #f8f9fa;
+        padding: 20px;
+        border-radius: 10px;
+        border: 2px solid #e0e0e0;
+        margin: 10px 0;
+    }
+    .metric-box {
+        background-color: white;
+        padding: 15px;
+        border-radius: 8px;
+        border-left: 4px solid;
+        text-align: center;
+        box-shadow: 0 2px 4px rgba(0,0,0,0.1);
+    }
+    .critical-box { border-left-color: #dc3545; }
+    .warning-box { border-left-color: #ffc107; }
+    .healthy-box { border-left-color: #28a745; }
+    .info-box { border-left-color: #007bff; }
+    </style>
+""", unsafe_allow_html=True)
+
+st.title("🏥 Hospital Medicine Stock Management System")
+st.markdown("**AI-Powered Inventory Monitoring & Stockout Prevention**")
+st.markdown("---")
+
+# Sidebar for Snowflake connection
+with st.sidebar:
+    st.header("🔐 Snowflake Connection")
+    
+    sf_user = st.text_input("Username", value=st.session_state.get('sf_user', ''))
+    sf_password = st.text_input("Password", type="password", value=st.session_state.get('sf_password', ''))
+    sf_account = st.text_input("Account URL", value=st.session_state.get('sf_account', ''),
+                               help="Example: abc123.snowflakecomputing.com")
+    
+    if st.button("Connect to Snowflake"):
+        if not sf_user or not sf_password or not sf_account:
+            st.error("❌ Please fill in all fields!")
+        else:
+            with st.spinner("Testing connection..."):
+                success, message = test_connection(sf_user, sf_password, sf_account)
+                if success:
+                    st.session_state['sf_user'] = sf_user
+                    st.session_state['sf_password'] = sf_password
+                    st.session_state['sf_account'] = sf_account
+                    st.session_state['connected'] = True
+                    st.success(f"✅ Connected! {message}")
+                    st.rerun()
+                else:
+                    st.error(f"❌ Connection failed: {message}")
+                    st.session_state['connected'] = False
+    
+    st.markdown("---")
+    
+    if st.session_state.get('connected', False):
+        st.success("✅ Connected Successfully")
+        st.info(f"Account: {st.session_state.get('sf_account', 'N/A')}")
+        if st.button("🔄 Disconnect"):
+            st.session_state['connected'] = False
+            st.session_state['data_loaded'] = False
+            st.rerun()
+        if st.button("Load Sample Data"):
+            conn = get_snowflake_connection()
+            if conn:
+                load_sample_data_to_snowflake(conn)
+                conn.close()
+                st.session_state['data_loaded'] = True
+            else:
+                st.error("Failed to connect. Please reconnect.")
+    else:
+        st.warning("⚠️ Not connected")
+
+# Main content
+if st.session_state.get('connected', False) and st.session_state.get('data_loaded', False):
+    
+    # Get connection
+    conn = get_snowflake_connection()
+    
+    if conn:
+        try:
+            # Date Filter Section
+            st.markdown("### 📅 Select Date Range")
+            col1, col2, col3 = st.columns([2, 2, 1])
+            
+            # Get available dates from database
+            date_query = "SELECT MIN(DATE) as min_date, MAX(DATE) as max_date FROM STOCK_RECORDS"
+            date_range = pd.read_sql(date_query, conn)
+            
+            with col1:
+                start_date = st.date_input(
+                    "From Date",
+                    value=pd.to_datetime(date_range['MIN_DATE'].iloc[0]) if len(date_range) > 0 else datetime.now(),
+                    key="start_date"
+                )
+            
+            with col2:
+                end_date = st.date_input(
+                    "To Date", 
+                    value=pd.to_datetime(date_range['MAX_DATE'].iloc[0]) if len(date_range) > 0 else datetime.now(),
+                    key="end_date"
+                )
+            
+            with col3:
+                st.markdown("<br>", unsafe_allow_html=True)
+                if st.button("🔍 Filter", use_container_width=True):
+                    st.session_state['date_filtered'] = True
+            
+            st.markdown("---")
+            
+            # SQL Worksheets Section
+            with st.expander("📝 View SQL Queries (Snowflake Worksheets)", expanded=False):
+                st.markdown("### Sample SQL Queries You Can Run in Snowflake Worksheets:")
+                
+                tab1, tab2, tab3 = st.tabs(["Stock Status Query", "Critical Items Query", "Reorder Query"])
+                
+                with tab1:
+                    sql1 = """-- View Current Stock Status
+SELECT 
+    hospital_name,
+    medicine_name,
+    current_stock,
+    stock_status,
+    days_until_stockout
+FROM CURRENT_STOCK_STATUS
+ORDER BY 
+    CASE stock_status 
+        WHEN 'CRITICAL' THEN 1 
+        WHEN 'WARNING' THEN 2 
+        ELSE 3 
+    END;"""
+                    st.code(sql1, language="sql")
+                    st.download_button("Download Query", sql1, "stock_status_query.sql", "text/plain")
+                
+                with tab2:
+                    sql2 = """-- Find Critical Items Only
+SELECT 
+    hospital_name,
+    medicine_name,
+    current_stock,
+    avg_daily_usage,
+    ROUND(days_until_stockout, 1) as days_left
+FROM CURRENT_STOCK_STATUS
+WHERE stock_status = 'CRITICAL'
+ORDER BY days_until_stockout;"""
+                    st.code(sql2, language="sql")
+                    st.download_button("Download Query", sql2, "critical_items_query.sql", "text/plain")
+                
+                with tab3:
+                    sql3 = """-- Get Reorder Recommendations
+SELECT 
+    hospital_name,
+    medicine_name,
+    current_stock,
+    recommended_order_quantity,
+    priority
+FROM REORDER_RECOMMENDATIONS
+WHERE stock_status IN ('CRITICAL', 'WARNING')
+ORDER BY priority, days_until_stockout;"""
+                    st.code(sql3, language="sql")
+                    st.download_button("Download Query", sql3, "reorder_query.sql", "text/plain")
+            
+            st.markdown("---")
+            
+            # Fetch data with date filter
+            stock_df = get_current_stock_data(conn)
+            reorder_df = get_reorder_recommendations(conn)
+            
+            # KPI Metrics in boxes
+            st.markdown("### 📊 Key Metrics Overview")
+            col1, col2, col3, col4 = st.columns(4)
+            
+            total_items = len(stock_df)
+            critical_count = len(stock_df[stock_df['stock_status'] == 'CRITICAL'])
+            warning_count = len(stock_df[stock_df['stock_status'] == 'WARNING'])
+            healthy_count = len(stock_df[stock_df['stock_status'] == 'HEALTHY'])
+            
+            with col1:
+                st.markdown(f"""
+                    <div class="metric-box info-box">
+                        <h1 style="margin:0; color:#007bff;">📦</h1>
+                        <h2 style="margin:10px 0; color:#212529;">{total_items}</h2>
+                        <p style="margin:0; color:#6c757d;">Total Items</p>
+                    </div>
+                """, unsafe_allow_html=True)
+            
+            with col2:
+                st.markdown(f"""
+                    <div class="metric-box critical-box">
+                        <h1 style="margin:0; color:#dc3545;">🚨</h1>
+                        <h2 style="margin:10px 0; color:#dc3545;">{critical_count}</h2>
+                        <p style="margin:0; color:#6c757d;">Critical</p>
+                    </div>
+                """, unsafe_allow_html=True)
+            
+            with col3:
+                st.markdown(f"""
+                    <div class="metric-box warning-box">
+                        <h1 style="margin:0; color:#ffc107;">⚠️</h1>
+                        <h2 style="margin:10px 0; color:#ffc107;">{warning_count}</h2>
+                        <p style="margin:0; color:#6c757d;">Warning</p>
+                    </div>
+                """, unsafe_allow_html=True)
+            
+            with col4:
+                st.markdown(f"""
+                    <div class="metric-box healthy-box">
+                        <h1 style="margin:0; color:#28a745;">✅</h1>
+                        <h2 style="margin:10px 0; color:#28a745;">{healthy_count}</h2>
+                        <p style="margin:0; color:#6c757d;">Healthy</p>
+                    </div>
+                """, unsafe_allow_html=True)
+            
+            st.markdown("---")
+            
+            # NEW: Stock Trend Over Time
+            st.subheader("📈 Stock Trend Analysis")
+            
+            try:
+                # Get historical data
+                trend_query = """
+                SELECT DATE, MEDICINE_NAME, CLOSING_STOCK, HOSPITAL_NAME
+                FROM STOCK_RECORDS
+                ORDER BY DATE, MEDICINE_NAME
+                """
+                trend_df = pd.read_sql(trend_query, conn)
+                trend_df.columns = trend_df.columns.str.lower()
+                
+                col1, col2 = st.columns([3, 1])
+                
+                with col1:
+                    # Let user select medicine
+                    medicines = sorted(trend_df['medicine_name'].unique())
+                    selected_medicine = st.selectbox("Select Medicine to Track:", medicines)
+                
+                with col2:
+                    # Chart type selector
+                    chart_type = st.radio("Chart Type:", ["Line", "Area"], horizontal=True)
+                
+                # Filter and plot
+                med_data = trend_df[trend_df['medicine_name'] == selected_medicine]
+                
+                if chart_type == "Line":
+                    fig = go.Figure()
+                    
+                    colors_list = ['#007bff', '#dc3545', '#28a745', '#ffc107', '#17a2b8']
+                    for idx, hospital in enumerate(med_data['hospital_name'].unique()):
+                        hosp_data = med_data[med_data['hospital_name'] == hospital]
+                        fig.add_trace(go.Scatter(
+                            x=hosp_data['date'],
+                            y=hosp_data['closing_stock'],
+                            name=hospital,
+                            mode='lines+markers',
+                            line=dict(width=3, color=colors_list[idx % len(colors_list)]),
+                            marker=dict(size=7),
+                            hovertemplate='<b>%{fullData.name}</b><br>Date: %{x}<br>Stock: %{y}<extra></extra>'
+                        ))
+                else:
+                    fig = go.Figure()
+                    
+                    colors_list = ['#007bff', '#dc3545', '#28a745', '#ffc107', '#17a2b8']
+                    for idx, hospital in enumerate(med_data['hospital_name'].unique()):
+                        hosp_data = med_data[med_data['hospital_name'] == hospital]
+                        fig.add_trace(go.Scatter(
+                            x=hosp_data['date'],
+                            y=hosp_data['closing_stock'],
+                            name=hospital,
+                            mode='lines',
+                            fill='tonexty',
+                            line=dict(width=2, color=colors_list[idx % len(colors_list)]),
+                            hovertemplate='<b>%{fullData.name}</b><br>Date: %{x}<br>Stock: %{y}<extra></extra>'
+                        ))
+                
+                fig.update_layout(
+                    title=f'📈 {selected_medicine} - Stock Trend',
+                    xaxis_title="Date",
+                    yaxis_title="Stock Level",
+                    height=420,
+                    hovermode='x unified'
+                )
+                
+                st.plotly_chart(fig, use_container_width=True)
+                
+            except Exception as e:
+                st.info("Add more historical data to see trends")
+            
+            st.markdown("---")
+            
+            # Alert Summary
+            st.subheader("📢 AI-Generated Alert Summary & Predictions")
+            
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                alert_text = generate_alert_summary(reorder_df)
+                st.markdown(alert_text)
+            
+            with col2:
+                # Prediction panel
+                st.markdown("### 🔮 Next 7 Days Forecast")
+                if len(reorder_df) > 0:
+                    will_run_out = reorder_df[reorder_df['days_until_stockout'] <= 7]
+                    if len(will_run_out) > 0:
+                        st.error(f"⚠️ **{len(will_run_out)} items** will run out within 7 days!")
+                        for idx, row in will_run_out.head(3).iterrows():
+                            st.warning(f"📉 {row['medicine_name']}: {int(row['days_until_stockout'])} days left")
+                    else:
+                        st.success("✅ All items safe for next 7 days")
+                else:
+                    st.success("✅ All stock levels healthy")
+            
+            st.markdown("---")
+            
+            # Visualizations
+            col1, col2 = st.columns([2, 1])
+            
+            with col1:
+                st.subheader("🔥 Stock Heatmap")
+                heatmap = create_stock_heatmap(stock_df)
+                st.plotly_chart(heatmap, use_container_width=True)
+            
+            with col2:
+                st.subheader("📊 Status Overview")
+                status_chart = create_status_chart(stock_df)
+                st.plotly_chart(status_chart, use_container_width=True)
+            
+            st.markdown("---")
+            
+            # Reorder Recommendations Table
+            st.subheader("📋 Reorder Recommendations")
+            
+            if len(reorder_df) > 0:
+                display_df = reorder_df[[
+                    'hospital_name', 'medicine_name', 'current_stock', 
+                    'avg_daily_usage', 'days_until_stockout', 
+                    'recommended_order_quantity', 'stock_status'
+                ]].copy()
+                
+                display_df.columns = [
+                    'Hospital', 'Medicine', 'Current Stock', 
+                    'Avg Daily Use', 'Days Until Stockout', 
+                    'Recommended Order', 'Status'
+                ]
+                
+                # Color code the status
+                def highlight_status(row):
+                    if row['Status'] == 'CRITICAL':
+                        return ['background-color: #ffcdd2'] * len(row)
+                    elif row['Status'] == 'WARNING':
+                        return ['background-color: #ffe0b2'] * len(row)
+                    else:
+                        return [''] * len(row)
+                
+                styled_df = display_df.style.apply(highlight_status, axis=1)
+                st.dataframe(styled_df, use_container_width=True, height=400)
+                
+                # Export button
+                csv = display_df.to_csv(index=False)
+                col1, col2 = st.columns(2)
+                with col1:
+                    st.download_button(
+                        label="📥 Download Reorder List (CSV)",
+                        data=csv,
+                        file_name=f"reorder_list_{datetime.now().strftime('%Y%m%d')}.csv",
+                        mime="text/csv"
+                    )
+                with col2:
+                    # Export full report as text
+                    report = f"""HOSPITAL STOCK MANAGEMENT REPORT
+Generated: {datetime.now().strftime('%Y-%m-%d %H:%M')}
+
+SUMMARY:
+- Total Items: {len(stock_df)}
+- Critical: {len(stock_df[stock_df['stock_status'] == 'CRITICAL'])}
+- Warning: {len(stock_df[stock_df['stock_status'] == 'WARNING'])}
+
+REORDER RECOMMENDATIONS:
+{display_df.to_string()}
+"""
+                    st.download_button(
+                        label="📄 Download Report (TXT)",
+                        data=report,
+                        file_name=f"stock_report_{datetime.now().strftime('%Y%m%d')}.txt",
+                        mime="text/plain"
+                    )
+            else:
+                st.success("✅ No reorders needed at this time!")
+            
+            # Detailed Stock Table
+            st.markdown("---")
+            
+            # NEW: AI Chat Assistant
+            st.subheader("🤖 AI Stock Assistant (Powered by Snowflake Cortex)")
+            
+            with st.expander("💬 Ask Questions About Stock", expanded=False):
+                user_question = st.text_input(
+                    "Ask anything about stock levels:",
+                    placeholder="e.g., Which medicines are critical? Show me insulin stock across hospitals"
+                )
+                
+                if st.button("Ask AI") and user_question:
+                    with st.spinner("AI is analyzing..."):
+                        try:
+                            # Simple AI-like response based on data
+                            if "critical" in user_question.lower():
+                                critical = stock_df[stock_df['stock_status'] == 'CRITICAL']
+                                if len(critical) > 0:
+                                    response = f"I found {len(critical)} critical items:\n\n"
+                                    for idx, row in critical.head(5).iterrows():
+                                        response += f"• **{row['medicine_name']}** at {row['hospital_name']} - only {int(row['current_stock'])} units left\n"
+                                else:
+                                    response = "Great news! No critical items right now."
+                            
+                            elif "insulin" in user_question.lower():
+                                insulin = stock_df[stock_df['medicine_name'].str.contains('Insulin', case=False, na=False)]
+                                if len(insulin) > 0:
+                                    response = "**Insulin Stock Status:**\n\n"
+                                    for idx, row in insulin.iterrows():
+                                        response += f"• {row['hospital_name']}: {int(row['current_stock'])} units ({row['stock_status']})\n"
+                                else:
+                                    response = "No insulin data found."
+                            
+                            elif "hospital" in user_question.lower() or "location" in user_question.lower():
+                                hospitals = stock_df.groupby('hospital_name').agg({
+                                    'stock_status': lambda x: (x == 'CRITICAL').sum()
+                                }).reset_index()
+                                response = "**Hospital Overview:**\n\n"
+                                for idx, row in hospitals.iterrows():
+                                    response += f"• {row['hospital_name']}: {int(row['stock_status'])} critical items\n"
+                            
+                            else:
+                                # General summary
+                                total = len(stock_df)
+                                critical_count = len(stock_df[stock_df['stock_status'] == 'CRITICAL'])
+                                warning_count = len(stock_df[stock_df['stock_status'] == 'WARNING'])
+                                response = f"**Current Stock Summary:**\n\n"
+                                response += f"• Total items tracked: {total}\n"
+                                response += f"• Critical alerts: {critical_count}\n"
+                                response += f"• Warning alerts: {warning_count}\n"
+                                response += f"• Healthy items: {total - critical_count - warning_count}"
+                            
+                            st.success(response)
+                        except Exception as e:
+                            st.error(f"Error: {str(e)}")
+            
+            st.markdown("---")
+            st.subheader("📦 Detailed Stock Inventory")
+            
+            detailed_df = stock_df[[
+                'hospital_name', 'medicine_name', 'current_stock', 
+                'min_stock_level', 'avg_daily_usage', 'lead_time_days', 'stock_status'
+            ]].copy()
+            
+            detailed_df.columns = [
+                'Hospital', 'Medicine', 'Current Stock', 
+                'Min Level', 'Avg Daily Use', 'Lead Time (Days)', 'Status'
+            ]
+            
+            st.dataframe(detailed_df, use_container_width=True, height=400)
+            
+        except Exception as e:
+            st.error(f"Error fetching data: {str(e)}")
+        finally:
+            conn.close()
+            
+else:
+    st.info("👈 Please connect to Snowflake and load sample data using the sidebar to begin.")
+    
+    st.markdown("### 🚀 Quick Start Guide:")
+    st.markdown("""
+    1. **Enter your Snowflake credentials** in the sidebar
+    2. **Click 'Connect to Snowflake'**
+    3. **Click 'Load Sample Data'** to populate the database
+    4. The dashboard will automatically display stock status and alerts
+    """)
+
+# Footer
+st.markdown("---")
+st.markdown("*Built for AI for Good Hackathon 2024 | Powered by Snowflake*")
