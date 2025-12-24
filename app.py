@@ -219,9 +219,9 @@ st.subheader("📊 Stock Overview")
 col1, col2, col3, col4 = st.columns(4)
 
 metric_box("Total Items", len(filtered_df), "#007bff")
-metric_box("Critical", len(filtered_df[filtered_df['stock_status']=="CRITICAL"]), "#dc3545")
-metric_box("Warning", len(filtered_df[filtered_df['stock_status']=="WARNING"]), "#ffc107")
-metric_box("Healthy", len(filtered_df[filtered_df['stock_status']=="HEALTHY"]), "#28a745")
+metric_box("Critical", len(filtered_df[filtered_df['STOCK_STATUS']=="CRITICAL"]), "#dc3545")
+metric_box("Warning", len(filtered_df[filtered_df['STOCK_STATUS']=="WARNING"]), "#ffc107")
+metric_box("Healthy", len(filtered_df[filtered_df['STOCK_STATUS']=="HEALTHY"]), "#28a745")
 
 st.markdown("---")
 
