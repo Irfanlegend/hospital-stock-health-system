@@ -1,6 +1,6 @@
 🚀 Live Demo
 
-👉 https://hospital-stock-health-system.streamlit.app/  
+👉 https://hospital-stock.streamlit.app/  
 
 🏥 Hospital Stock Health System
 AI-Powered Medicine Inventory Monitoring & Stockout Prevention
