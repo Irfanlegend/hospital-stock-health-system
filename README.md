@@ -81,7 +81,7 @@ SNOWFLAKE_SCHEMA="INVENTORY"
 
 🌐 Live Demo URL
 
-👉 https://hospital-stock-health-system.streamlit.app/
+👉 https://hospital-stock.streamlit.app/
 
 🎥 Demo Video
 
