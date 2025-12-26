@@ -85,7 +85,7 @@ SNOWFLAKE_SCHEMA="INVENTORY"
 
 🎥 Demo Video
 
-👉 https://youtu.be/your-demo-video
+👉 https://youtu.be/S78eJ-WvZc0
 
 
 📁 Project Structure
